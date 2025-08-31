@@ -1,0 +1,102 @@
+﻿#!/usr/bin/env bash
+set -euo pipefail
+
+########################################
+# 配置（如需修改仅改这里）
+########################################
+export CUDA_HOME=${CUDA_HOME:-/usr/local/cuda-12.4}
+export PATH="$CUDA_HOME/bin:$PATH"
+export LD_LIBRARY_PATH="$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
+# 你的 GPU 计算能力：7.5（Turing）
+export TORCH_CUDA_ARCH_LIST="7.5"
+# 版本绑定（torch 2.4.x ↔ vision 0.19.x）
+TORCH_TAG="v2.4.1"
+VISION_TAG="v0.19.1"
+
+echo "==> CUDA_HOME: $CUDA_HOME"
+nvcc --version || true
+nvidia-smi || true
+
+########################################
+# 系统与 Python 依赖
+########################################
+echo "==> Installing build deps..."
+sudo apt-get update
+sudo apt-get install -y git build-essential cmake ninja-build
+
+python -m pip install -U pip setuptools wheel
+python -m pip install -U typing_extensions mkl mkl-include
+
+########################################
+# 编译安装 PyTorch
+########################################
+echo "==> Building PyTorch $TORCH_TAG ..."
+if [ ! -d pytorch ]; then
+  git clone --recursive --branch "$TORCH_TAG" https://github.com/pytorch/pytorch.git
+else
+  echo "pytorch/ 已存在，跳过 clone"
+fi
+
+pushd pytorch
+python -m pip install -r requirements.txt
+
+export MAX_JOBS="$(nproc)"
+export USE_CUDA=1
+export BUILD_TEST=0
+export REL_WITH_DEB_INFO=1
+export USE_NINJA=1
+
+# 生成 wheel
+python setup.py bdist_wheel
+# 安装刚编好的本地 wheel
+python -m pip install dist/torch-*.whl
+popd
+
+########################################
+# 编译安装 torchvision
+########################################
+echo "==> Building torchvision $VISION_TAG ..."
+if [ ! -d vision ]; then
+  git clone --branch "$VISION_TAG" https://github.com/pytorch/vision.git
+else
+  echo "vision/ 已存在，跳过 clone"
+fi
+
+pushd vision
+python -m pip install -r requirements.txt
+export FORCE_CUDA=1
+python setup.py bdist_wheel
+python -m pip install dist/torchvision-*.whl
+popd
+
+########################################
+# 安装 AutoAWQ & Transformers
+########################################
+echo "==> Installing AutoAWQ & Transformers"
+python -m pip install -U autoawq autoawq-kernels transformers accelerate safetensors
+
+########################################
+# 快速自检
+########################################
+python - << 'PY'
+import torch, torchvision, os
+print("torch:", torch.__version__,
+      "| cuda:", torch.version.cuda,
+      "| is_available:", torch.cuda.is_available())
+if torch.cuda.is_available():
+    print("device:", torch.cuda.get_device_name(0))
+print("TORCH_CUDA_ARCH_LIST:", os.environ.get("TORCH_CUDA_ARCH_LIST"))
+import awq, transformers
+print("awq ok,", "transformers:", transformers.__version__)
+PY
+
+echo "==> All done."
+echo "你现在可以直接运行示例代码："
+cat <<'PYX'
+from awq import AutoAWQForCausalLM
+from transformers import AutoTokenizer
+base = "facebook/opt-125m"
+tok = AutoTokenizer.from_pretrained(base, use_fast=True)
+model = AutoAWQForCausalLM.from_pretrained(base, device_map="auto")
+print("Loaded base OK")
+PYX
